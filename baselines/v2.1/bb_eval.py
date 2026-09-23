@@ -10,8 +10,8 @@ from __future__ import annotations
 import numpy as np
 from numba import njit
 
-from engine import bb
-from engine.bb import (
+import bb
+from bb import (
     BISHOP,
     KING,
     KING_ATT,
@@ -24,6 +24,7 @@ from engine.bb import (
     PAWN,
     QUEEN,
     ROOK,
+    ST_CASTLE,
     ST_SIDE,
     WHITE,
     bishop_attacks,
@@ -33,7 +34,7 @@ from engine.bb import (
     queen_attacks,
     rook_attacks,
 )
-from engine.pesto import (
+from evaluate import (
     _EG_BISHOP,
     _EG_KING,
     _EG_KNIGHT,
@@ -49,7 +50,6 @@ from engine.pesto import (
     EG_VALUE,
     MG_VALUE,
 )
-from engine.nnue import blend_residual
 
 PHASE_MAX = 24
 TEMPO = 10
@@ -174,16 +174,19 @@ def king_shield(king_sq: np.int64, pawns: np.int64, white: bool) -> np.int64:
     r = king_sq >> 3
     centre = 2 < f < 5
     shield_rank = r + 1 if white else r - 1
-    bonus = np.int64(-16) if centre else np.int64(0)
+    bonus = np.int64(-18) if centre else np.int64(0)
     if shield_rank < 0 or shield_rank > 7:
         return bonus
     for df in range(-1, 2):
         ff = f + df
         if 0 <= ff <= 7:
             if pawns & bb.BIT[shield_rank * 8 + ff]:
-                bonus += 16 if not centre else 8
+                bonus += 18 if not centre else 10
             else:
-                bonus -= 10 if not centre else 6
+                bonus -= 12 if not centre else 8
+            far = shield_rank + 1 if white else shield_rank - 1
+            if 0 <= far <= 7 and pawns & bb.BIT[far * 8 + ff]:
+                bonus += 6 if not centre else 3
     return bonus
 
 
@@ -202,11 +205,11 @@ def king_file_weakness(
         ours = our_pawns & file_bb
         theirs = enemy_pawns & file_bb
         if ours == 0:
-            penalty += 14
+            penalty += 18
             if theirs == 0:
-                penalty += 10
+                penalty += 14
         elif theirs == 0:
-            penalty += 6
+            penalty += 8
     return penalty
 
 
@@ -221,25 +224,25 @@ def king_attackers(king_sq: np.int64, bbs: np.ndarray, enemy: np.int64, occ: np.
         sq = lsb(b)
         b &= b - 1
         if KNIGHT_ATT[sq] & ring:
-            score += 18
+            score += 20
     b = bbs[base + BISHOP]
     while b != 0:
         sq = lsb(b)
         b &= b - 1
         if bishop_attacks(sq, occ) & ring:
-            score += 12
+            score += 14
     b = bbs[base + ROOK]
     while b != 0:
         sq = lsb(b)
         b &= b - 1
         if rook_attacks(sq, occ) & ring:
-            score += 16
+            score += 20
     b = bbs[base + QUEEN]
     while b != 0:
         sq = lsb(b)
         b &= b - 1
         if queen_attacks(sq, occ) & ring:
-            score += 28
+            score += 36
     return score
 
 
@@ -249,7 +252,7 @@ def _king_flights(king_sq: np.int64, own: np.int64, enemy_pawn_att: np.int64) ->
     flights = popcount(KING_ATT[king_sq] & ~own & ~enemy_pawn_att)
     if flights >= 3:
         return np.int64(0)
-    return np.int64((3 - flights) * 10)
+    return np.int64((3 - flights) * 12)
 
 
 @njit(cache=False)
@@ -305,6 +308,226 @@ def _pawn_threats(watt: np.int64, batt: np.int64, bbs: np.ndarray) -> np.int64:
 
 
 @njit(cache=False)
+def pawn_storm(
+    king_sq: np.int64, enemy_pawns: np.int64, white_king: bool
+) -> np.int64:
+    """Enemy pawns advancing on a wing king's files."""
+    f = king_sq & 7
+    if 2 < f < 5:
+        return np.int64(0)
+    penalty = np.int64(0)
+    for df in range(-1, 2):
+        ff = f + df
+        if ff < 0 or ff > 7:
+            continue
+        b = enemy_pawns & FILE_BB[ff]
+        while b != 0:
+            sq = lsb(b)
+            b &= b - 1
+            r = sq >> 3
+            if white_king:
+                if r <= 3:
+                    penalty += np.int64((4 - r) * 8)
+            elif r >= 4:
+                penalty += np.int64((r - 3) * 8)
+    return penalty
+
+
+@njit(cache=False)
+def _king_pressure(
+    raw: np.int64, enemy_queens: np.int64, enemy_minors: np.int64
+) -> np.int64:
+    """Attacks without a queen are much less dangerous; a pile-on is worse than linear."""
+    if enemy_queens == 0:
+        if enemy_minors < 2:
+            return raw // 4
+        raw = raw // 2
+    if raw > 48:
+        raw += raw - 48
+    return raw
+
+
+@njit(cache=False)
+def _mobility(bbs: np.ndarray) -> tuple:
+    occ = bbs[OCC_W] | bbs[OCC_B]
+    wsafe = ~bbs[OCC_W]
+    bsafe = ~bbs[OCC_B]
+    mg = np.int64(0)
+    eg = np.int64(0)
+
+    n = np.int64(0)
+    b = bbs[KNIGHT]
+    while b != 0:
+        sq = lsb(b)
+        b &= b - 1
+        n += popcount(KNIGHT_ATT[sq] & wsafe)
+    mg += n * 4
+    eg += n * 5
+    n = np.int64(0)
+    b = bbs[6 + KNIGHT]
+    while b != 0:
+        sq = lsb(b)
+        b &= b - 1
+        n += popcount(KNIGHT_ATT[sq] & bsafe)
+    mg -= n * 4
+    eg -= n * 5
+
+    n = np.int64(0)
+    b = bbs[BISHOP]
+    while b != 0:
+        sq = lsb(b)
+        b &= b - 1
+        n += popcount(bishop_attacks(sq, occ) & wsafe)
+    mg += n * 3
+    eg += n * 4
+    n = np.int64(0)
+    b = bbs[6 + BISHOP]
+    while b != 0:
+        sq = lsb(b)
+        b &= b - 1
+        n += popcount(bishop_attacks(sq, occ) & bsafe)
+    mg -= n * 3
+    eg -= n * 4
+
+    n = np.int64(0)
+    b = bbs[ROOK]
+    while b != 0:
+        sq = lsb(b)
+        b &= b - 1
+        n += popcount(rook_attacks(sq, occ) & wsafe)
+    mg += n * 2
+    eg += n * 3
+    n = np.int64(0)
+    b = bbs[6 + ROOK]
+    while b != 0:
+        sq = lsb(b)
+        b &= b - 1
+        n += popcount(rook_attacks(sq, occ) & bsafe)
+    mg -= n * 2
+    eg -= n * 3
+
+    n = np.int64(0)
+    b = bbs[QUEEN]
+    while b != 0:
+        sq = lsb(b)
+        b &= b - 1
+        n += popcount((bishop_attacks(sq, occ) | rook_attacks(sq, occ)) & wsafe)
+    mg += n * 1
+    eg += n * 1
+    n = np.int64(0)
+    b = bbs[6 + QUEEN]
+    while b != 0:
+        sq = lsb(b)
+        b &= b - 1
+        n += popcount((bishop_attacks(sq, occ) | rook_attacks(sq, occ)) & bsafe)
+    mg -= n * 1
+    eg -= n * 1
+    return mg, eg
+
+
+@njit(cache=False)
+def _hanging_material(bbs: np.ndarray) -> np.int64:
+    """White-positive: a piece that can be taken for free or by a cheaper unit."""
+    occ = bbs[OCC_W] | bbs[OCC_B]
+    mg = np.int64(0)
+    for code in range(12):
+        t = code % 6
+        if t == KING:
+            continue
+        us = np.int64(0) if code < 6 else np.int64(1)
+        them = 1 - us
+        sign = np.int64(1) if code < 6 else np.int64(-1)
+        our = bbs[OCC_W + us]
+        their = bbs[OCC_W + them]
+        b = bbs[code]
+        while b != 0:
+            sq = lsb(b)
+            b &= b - 1
+            att = attackers_to(bbs, sq, occ)
+            enemy_att = att & their
+            if enemy_att == 0:
+                continue
+            if (att & our) == 0:
+                mg -= sign * SEE_VALUE[t]
+                continue
+            cheap = np.int64(-1)
+            base = them * 6
+            for pt in range(6):
+                if enemy_att & bbs[base + pt]:
+                    cheap = np.int64(pt)
+                    break
+            if cheap >= 0 and SEE_VALUE[cheap] < SEE_VALUE[t]:
+                mg -= sign * (SEE_VALUE[t] - SEE_VALUE[cheap])
+    return mg
+
+
+@njit(cache=False)
+def _passed_extras(
+    bbs: np.ndarray,
+    wp: np.int64,
+    bp: np.int64,
+    wk: np.int64,
+    bk: np.int64,
+    watt: np.int64,
+    batt: np.int64,
+) -> tuple:
+    """King tropism, rook behind, protected passer, and a pawn-race term."""
+    mg = np.int64(0)
+    eg = np.int64(0)
+    b = wp
+    while b != 0:
+        sq = lsb(b)
+        b &= b - 1
+        if bp & PASSED_W[sq]:
+            continue
+        r = sq >> 3
+        wf = sq & 7
+        our = max(abs((wk & 7) - wf), abs((wk >> 3) - r))
+        their = max(abs((bk & 7) - wf), abs((bk >> 3) - r))
+        eg += np.int64((their - our) * PASSED_EG[r] // 10)
+        if bbs[ROOK] & FILE_BB[wf] & (bb.BIT[sq] - 1):
+            mg += 10
+            eg += 22
+        if watt & bb.BIT[sq]:
+            mg += 8
+            eg += 16
+        pmoves = 7 - r
+        if r == 1:
+            pmoves -= 1
+        kdist = max(abs((bk & 7) - wf), abs((bk >> 3) - 7))
+        if kdist > pmoves:
+            eg += np.int64(24 + 8 * (kdist - pmoves))
+        if (wk & 7) == wf and (wk >> 3) > r:
+            eg += np.int64(12)
+    b = bp
+    while b != 0:
+        sq = lsb(b)
+        b &= b - 1
+        if wp & PASSED_B[sq]:
+            continue
+        r = sq >> 3
+        wf = sq & 7
+        our = max(abs((bk & 7) - wf), abs((bk >> 3) - r))
+        their = max(abs((wk & 7) - wf), abs((wk >> 3) - r))
+        eg -= np.int64((their - our) * PASSED_EG[7 - r] // 10)
+        if bbs[6 + ROOK] & FILE_BB[wf] & ~(bb.BIT[sq] - 1) & ~bb.BIT[sq]:
+            mg -= 10
+            eg -= 22
+        if batt & bb.BIT[sq]:
+            mg -= 8
+            eg -= 16
+        pmoves = r
+        if r == 6:
+            pmoves -= 1
+        kdist = max(abs((wk & 7) - wf), abs((wk >> 3) - 0))
+        if kdist > pmoves:
+            eg -= np.int64(24 + 8 * (kdist - pmoves))
+        if (bk & 7) == wf and (bk >> 3) < r:
+            eg -= np.int64(12)
+    return mg, eg
+
+
+@njit(cache=False)
 def non_pawn_material(bbs: np.ndarray, side: np.int64) -> np.int64:
     base = side * 6
     total = np.int64(0)
@@ -314,7 +537,7 @@ def non_pawn_material(bbs: np.ndarray, side: np.int64) -> np.int64:
 
 
 @njit(cache=False)
-def evaluate_classical(bbs: np.ndarray, st: np.ndarray, pc: np.ndarray) -> np.int64:
+def evaluate(bbs: np.ndarray, st: np.ndarray, pc: np.ndarray) -> np.int64:
     mg = np.int64(0)
     eg = np.int64(0)
     phase = np.int64(0)
@@ -358,8 +581,8 @@ def evaluate_classical(bbs: np.ndarray, st: np.ndarray, pc: np.ndarray) -> np.in
             mg += 8
             eg += 6
         if bb.BIT[sq] & RANK_BB[6]:
-            mg += 12
-            eg += 18
+            mg += 16
+            eg += 24
     b = bbs[6 + ROOK]
     while b != 0:
         sq = lsb(b)
@@ -372,8 +595,8 @@ def evaluate_classical(bbs: np.ndarray, st: np.ndarray, pc: np.ndarray) -> np.in
             mg -= 8
             eg -= 6
         if bb.BIT[sq] & RANK_BB[1]:
-            mg -= 12
-            eg -= 18
+            mg -= 16
+            eg -= 24
 
     wk = lsb(bbs[KING])
     bk = lsb(bbs[6 + KING])
@@ -382,16 +605,43 @@ def evaluate_classical(bbs: np.ndarray, st: np.ndarray, pc: np.ndarray) -> np.in
     mg -= king_file_weakness(wk, wp, bp)
     mg += king_file_weakness(bk, bp, wp)
     occ = bbs[OCC_W] | bbs[OCC_B]
-    mg -= king_attackers(wk, bbs, np.int64(1), occ)
-    mg += king_attackers(bk, bbs, np.int64(0), occ)
-    mg -= pin_pressure(wk, bbs, np.int64(0), occ)
-    mg += pin_pressure(bk, bbs, np.int64(1), occ)
-
     watt = ((wp & NOT_FILE_A) << 7) | ((wp & NOT_FILE_H) << 9)
     batt = lsr(bp & NOT_FILE_H, 7) | lsr(bp & NOT_FILE_A, 9)
-    mg -= _king_flights(wk, bbs[OCC_W], batt)
-    mg += _king_flights(bk, bbs[OCC_B], watt)
+    wq = popcount(bbs[QUEEN])
+    bq = popcount(bbs[6 + QUEEN])
+    wmin = popcount(bbs[KNIGHT] | bbs[BISHOP])
+    bmin = popcount(bbs[6 + KNIGHT] | bbs[6 + BISHOP])
+    w_home = wk == 4 and (st[ST_CASTLE] & 3) != 0
+    b_home = bk == 60 and (st[ST_CASTLE] & 12) != 0
+    if not w_home:
+        mg -= _king_pressure(king_attackers(wk, bbs, np.int64(1), occ), bq, bmin)
+        mg -= pawn_storm(wk, bp, True)
+        mg -= pin_pressure(wk, bbs, np.int64(0), occ)
+        mg -= _king_flights(wk, bbs[OCC_W], batt)
+    if not b_home:
+        mg += _king_pressure(king_attackers(bk, bbs, np.int64(0), occ), wq, wmin)
+        mg += pawn_storm(bk, wp, False)
+        mg += pin_pressure(bk, bbs, np.int64(1), occ)
+        mg += _king_flights(bk, bbs[OCC_B], watt)
     mg += _pawn_threats(watt, batt, bbs)
+    mmg, meg = _mobility(bbs)
+    mg += mmg
+    eg += meg
+    pmg2, peg2 = _passed_extras(bbs, wp, bp, wk, bk, watt, batt)
+    mg += pmg2
+    eg += peg2
+    hang = _hanging_material(bbs)
+    mg += hang // 2
+
+    if (
+        popcount(bbs[BISHOP]) == 1
+        and popcount(bbs[6 + BISHOP]) == 1
+        and (bbs[ROOK] | bbs[6 + ROOK] | bbs[QUEEN] | bbs[6 + QUEEN]) == 0
+    ):
+        ws = lsb(bbs[BISHOP])
+        bs = lsb(bbs[6 + BISHOP])
+        if (((ws & 7) + (ws >> 3)) & 1) != (((bs & 7) + (bs >> 3)) & 1):
+            eg = eg * 5 // 8
 
     if phase > PHASE_MAX:
         phase = PHASE_MAX
@@ -400,27 +650,23 @@ def evaluate_classical(bbs: np.ndarray, st: np.ndarray, pc: np.ndarray) -> np.in
     side = st[ST_SIDE]
     score += TEMPO if side == WHITE else -TEMPO
 
-    if phase <= 8:
+    if phase <= 12:
         w_material = non_pawn_material(bbs, np.int64(0)) + 100 * popcount(wp)
         b_material = non_pawn_material(bbs, np.int64(1)) + 100 * popcount(bp)
         diff = w_material - b_material
-        if diff >= 350 or diff <= -350:
+        thresh = 250 if phase <= 8 else 450
+        if diff >= thresh or diff <= -thresh:
             chebyshev = max(abs((wk & 7) - (bk & 7)), abs((wk >> 3) - (bk >> 3)))
+            close = 6 if phase <= 8 else 3
+            corner = 16 if phase <= 8 else 8
             if diff > 0:
                 edge = min(min(bk & 7, 7 - (bk & 7)), min(bk >> 3, 7 - (bk >> 3)))
-                score += 4 * (7 - chebyshev) + 12 * (3 - edge)
+                score += close * (7 - chebyshev) + corner * (3 - edge)
             else:
                 edge = min(min(wk & 7, 7 - (wk & 7)), min(wk >> 3, 7 - (wk >> 3)))
-                score -= 4 * (7 - chebyshev) + 12 * (3 - edge)
+                score -= close * (7 - chebyshev) + corner * (3 - edge)
 
     return score if side == WHITE else -score
-
-
-@njit(cache=False)
-def evaluate(bbs: np.ndarray, st: np.ndarray, pc: np.ndarray) -> np.int64:
-    """Search eval: classical + 3/5 clip(nnue − classical) (60% NNUE)."""
-    classical = evaluate_classical(bbs, st, pc)
-    return blend_residual(bbs, st[ST_SIDE], classical)
 
 
 # ------------------------------------------------------------------------- SEE

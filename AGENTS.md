@@ -37,7 +37,8 @@ and they change, so fetch them before you rely on a number.
 ## Layout
 
 - `agent.py` — contract. Keep it readable; a judge reads it if a game is flagged.
-- `engine/` — `bb.py`, `bb_search.py`, `bb_eval.py`, `bbpos.py`, `book.py`, `evaluate.py`, `nnue.py`.
+- `engine/` — v7.1.1. `play.py` is the loop, `bb_search.py` the numba PVS, `bb_eval.py` the classical + NNUE mix.
+- `baselines/v2.1` — published classical engine. `baselines/self_v3` is the previous Stage 3 root, frozen.
 - `weights/` — shipped with the zip. Paths are relative to the repo/zip root.
 - `harness/` — official protocol. **Do not edit.**
 - `baselines/self_v*` — frozen A/B opponents. Do not edit.

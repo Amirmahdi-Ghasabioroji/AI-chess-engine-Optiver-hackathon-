@@ -802,7 +802,9 @@ def perft(
 
 
 def new_buffers() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    # Column 5: move played at this ply (countermove). Column 6: static eval.
+    # Column 5 is spare for the search to record the move played at each ply,
+    # which the counter-move heuristic reads back.
+    # Column 5: move played at this ply (counter-move). Column 6: static eval.
     hist = np.zeros((MAX_PLY + 8, 7), dtype=np.int64)
     moves = np.zeros((MAX_PLY + 8) * MAX_MOVES, dtype=np.int32)
     scores = np.zeros((MAX_PLY + 8) * MAX_MOVES, dtype=np.int32)

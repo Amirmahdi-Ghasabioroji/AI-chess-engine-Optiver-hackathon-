@@ -264,9 +264,3 @@ def probe(board: chess.Board) -> chess.Move | None:
     if move in board.legal_moves:
         return move
     return None
-
-
-def book_move(fen: str) -> str | None:
-    """UCI reply for a FEN, or None. Same book as probe()."""
-    move = probe(chess.Board(fen))
-    return None if move is None else move.uci()

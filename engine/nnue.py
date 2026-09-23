@@ -1,202 +1,340 @@
-"""Learned residual on top of PeSTO.
+"""Sparse STM NNUE: 768 piece-square → H1 ReLU → H2 ReLU → 1.
 
-Search never imports torch. Training writes `weights/nnue.npz`; `load()` copies
-those arrays into buffers the jitted evaluator already holds. Piece embeddings
-are maintained incrementally on PVS make/unmake. Quiescence stays PeSTO.
-
-If the npz is missing, the residual is zero and the engine is Stage 2 PeSTO
-plus the linear PST fallback in `bb_eval`.
+Weights ship next to agent.py, in weights/, and in data/. The loader also
+opens the submission zip so a missing data/ extract cannot fall back silently.
 """
 
 from __future__ import annotations
 
+import io
+import sys
+import zipfile
 from pathlib import Path
 
 import numpy as np
 from numba import njit
 
-from . import bb
+from engine.pos import Position
+from engine.bb import lsb
 
-N_FEAT = 12 * 64
-H1 = 64
-H2 = 16
-CLIP = 300
-SCALE = 250.0
+N_FEATURES = 768
+HIDDEN1 = 160
+HIDDEN2 = 32
+WEIGHTS_PATH = Path(__file__).resolve().parent.parent / "data" / "nnue.npz"
+WEIGHT_NAMES = ("nnue.npz", "weights/nnue.npz", "data/nnue.npz")
+LOADED_FROM: str | None = None
 
-WEIGHTS_DIR = Path(__file__).resolve().parent.parent / "weights"
-WEIGHTS_PT = WEIGHTS_DIR / "nnue.pt"
-WEIGHTS_NPZ = WEIGHTS_DIR / "nnue.npz"
-WEIGHTS_PATH = WEIGHTS_NPZ
-
-W0 = np.zeros((N_FEAT, H1), dtype=np.float32)
-B0 = np.zeros(H1, dtype=np.float32)
-W1 = np.zeros((H1, H2), dtype=np.float32)
-B1 = np.zeros(H2, dtype=np.float32)
-W2 = np.zeros(H2, dtype=np.float32)
-B2 = np.zeros(1, dtype=np.float32)
-ENABLED = np.zeros(1, dtype=np.int32)
-
-
-def _install(blob: dict[str, np.ndarray]) -> None:
-    w0 = np.asarray(blob["w0"], dtype=np.float32)
-    if w0.shape != W0.shape:
-        raise ValueError(f"weight shape {w0.shape} != {W0.shape}")
-    W0[:, :] = w0
-    B0[:] = np.asarray(blob["b0"], dtype=np.float32).reshape(H1)
-    W1[:, :] = np.asarray(blob["w1"], dtype=np.float32).reshape(H1, H2)
-    B1[:] = np.asarray(blob["b1"], dtype=np.float32).reshape(H2)
-    W2[:] = np.asarray(blob["w2"], dtype=np.float32).reshape(H2)
-    B2[0] = float(np.asarray(blob["b2"]).reshape(-1)[0])
-    ENABLED[0] = 1
-
-
-def load(path: Path | None = None) -> bool:
-    """Load `weights/nnue.npz` into the numba buffers. Never raises."""
-    ENABLED[0] = 0
-    target = path if path is not None else WEIGHTS_NPZ
-    if not target.is_file():
-        return False
-    try:
-        blob = np.load(target)
-        _install({k: blob[k] for k in ("w0", "b0", "w1", "b1", "w2", "b2")})
-        return True
-    except (OSError, KeyError, ValueError):
-        ENABLED[0] = 0
-        return False
-
-
-def new_acc() -> tuple[np.ndarray, np.ndarray]:
-    return np.zeros(H1, dtype=np.float32), np.zeros((bb.MAX_PLY + 8, H1), dtype=np.float32)
-
-
-def disable() -> None:
-    ENABLED[0] = 0
-    W0[:, :] = 0
-    B0[:] = 0
-    W1[:, :] = 0
-    B1[:] = 0
-    W2[:] = 0
-    B2[:] = 0
+_w1 = np.zeros((N_FEATURES, HIDDEN1), dtype=np.float32)
+_b1 = np.zeros(HIDDEN1, dtype=np.float32)
+_w2 = np.zeros((HIDDEN1, HIDDEN2), dtype=np.float32)
+_b2 = np.zeros(HIDDEN2, dtype=np.float32)
+_w3 = np.zeros((HIDDEN2, 1), dtype=np.float32)
+_b3 = np.zeros(1, dtype=np.float32)
+_scale = np.float32(400.0)
+_clip = np.float32(2000.0)
+_ready = False
+_idx_buf = np.empty(32, dtype=np.int32)
 
 
 @njit(cache=False)
-def _acc_add(acc: np.ndarray, feat: np.int64) -> None:
-    row = W0[feat]
-    for i in range(H1):
-        acc[i] += row[i]
+def _forward(
+    idx: np.ndarray,
+    n: np.int32,
+    w1: np.ndarray,
+    b1: np.ndarray,
+    w2: np.ndarray,
+    b2: np.ndarray,
+    w3: np.ndarray,
+    b3: np.ndarray,
+    scale: np.float32,
+    clip: np.float32,
+) -> np.float32:
+    hidden = b1.copy()
+    for i in range(n):
+        hidden += w1[idx[i]]
+    for i in range(hidden.shape[0]):
+        if hidden[i] < 0.0:
+            hidden[i] = 0.0
+    h2 = b2.copy()
+    for j in range(w2.shape[1]):
+        acc = h2[j]
+        for i in range(w2.shape[0]):
+            acc += hidden[i] * w2[i, j]
+        h2[j] = acc if acc > 0.0 else 0.0
+    out = b3[0]
+    for i in range(w3.shape[0]):
+        out += h2[i] * w3[i, 0]
+    score = out * scale
+    if score > clip:
+        score = clip
+    elif score < -clip:
+        score = -clip
+    return np.float32(score)
+
+
+def _material(pos: Position) -> int:
+    vals = (100, 320, 330, 500, 900)
+    score = 0
+    for pt, val in enumerate(vals):
+        score += val * (pos.bb[pt].bit_count() - pos.bb[pt + 6].bit_count())
+    return score if pos.side == 0 else -score
 
 
 @njit(cache=False)
-def _acc_sub(acc: np.ndarray, feat: np.int64) -> None:
-    row = W0[feat]
-    for i in range(H1):
-        acc[i] -= row[i]
+def fill_indices_bbs(bbs: np.ndarray, side: np.int64, buf: np.ndarray) -> np.int32:
+    """STM-oriented indices from the jitted `bbs` layout (same as fill_indices)."""
+    flip = np.int64(56) if side != 0 else np.int64(0)
+    n = np.int32(0)
+    for piece in range(12):
+        bits = bbs[piece]
+        stm_piece = piece
+        if side != 0:
+            stm_piece = piece + 6 if piece < 6 else piece - 6
+        plane = stm_piece * 64
+        while bits != 0:
+            sq = lsb(bits)
+            bits &= bits - 1
+            buf[n] = plane + (sq ^ flip)
+            n += 1
+            if n >= buf.shape[0]:
+                return n
+    return n
 
 
 @njit(cache=False)
-def acc_refresh(acc: np.ndarray, bbs: np.ndarray) -> None:
-    """Rebuild `acc` from the current bitboards."""
-    for i in range(H1):
-        acc[i] = B0[i]
-    if ENABLED[0] == 0:
-        return
-    for code in range(12):
-        b = bbs[code]
-        while b != 0:
-            sq = bb.lsb(b)
-            b &= b - 1
-            _acc_add(acc, np.int64(code * 64 + sq))
-
-
-@njit(cache=False)
-def acc_apply_move(acc: np.ndarray, mb: np.ndarray, st: np.ndarray, mv: np.int64) -> None:
-    """Update `acc` for `mv` using the mailbox *before* make_move."""
-    if ENABLED[0] == 0:
-        return
-    frm = mv & 63
-    to = (mv >> 6) & 63
-    promo = (mv >> 12) & 7
-    mtype = (mv >> 15) & 3
-    side = st[bb.ST_SIDE]
-    us = side * 6
-    piece = np.int64(mb[frm])
-    _acc_sub(acc, piece * 64 + frm)
-    if mtype == bb.MT_EP:
-        cap_sq = to - 8 if side == bb.WHITE else to + 8
-        _acc_sub(acc, np.int64((1 - side) * 6 + bb.PAWN) * 64 + cap_sq)
-    else:
-        occupant = np.int64(mb[to])
-        if occupant >= 0:
-            _acc_sub(acc, occupant * 64 + to)
-    if promo != 0:
-        _acc_add(acc, np.int64(us + promo) * 64 + to)
-    else:
-        _acc_add(acc, piece * 64 + to)
-    if mtype == bb.MT_CASTLE:
-        if to == 6:
-            _acc_sub(acc, np.int64(us + bb.ROOK) * 64 + 7)
-            _acc_add(acc, np.int64(us + bb.ROOK) * 64 + 5)
-        elif to == 2:
-            _acc_sub(acc, np.int64(us + bb.ROOK) * 64 + 0)
-            _acc_add(acc, np.int64(us + bb.ROOK) * 64 + 3)
-        elif to == 62:
-            _acc_sub(acc, np.int64(us + bb.ROOK) * 64 + 63)
-            _acc_add(acc, np.int64(us + bb.ROOK) * 64 + 61)
-        else:
-            _acc_sub(acc, np.int64(us + bb.ROOK) * 64 + 56)
-            _acc_add(acc, np.int64(us + bb.ROOK) * 64 + 59)
-
-
-@njit(cache=False)
-def acc_push(
-    acc: np.ndarray, stack: np.ndarray, ply: np.int64, mb: np.ndarray, st: np.ndarray, mv: np.int64
-) -> None:
-    stack[ply, :] = acc
-    acc_apply_move(acc, mb, st, mv)
-
-
-@njit(cache=False)
-def acc_pop(acc: np.ndarray, stack: np.ndarray, ply: np.int64) -> None:
-    acc[:] = stack[ply]
-
-
-@njit(cache=False)
-def nnue_affine(acc: np.ndarray, st: np.ndarray) -> np.int64:
-    """MLP + tanh on a filled accumulator. `acc` is white-oriented, pre-CReLU.
-
-    CReLU is applied while multiplying so a node does 64×16 fused multiply-adds
-    and no heap traffic. Allocating a hidden copy here was the nps tax.
-    """
-    if ENABLED[0] == 0:
+def evaluate_nnue_bbs(bbs: np.ndarray, side: np.int64) -> np.int64:
+    """Side-to-move centipawns from the net alone."""
+    buf = np.empty(32, dtype=np.int32)
+    n = fill_indices_bbs(bbs, side, buf)
+    if n == 0:
         return np.int64(0)
-    raw = B2[0]
-    for j in range(H2):
-        total = B1[j]
-        for i in range(H1):
-            x = acc[i]
-            if x < 0.0:
-                x = np.float32(0.0)
-            elif x > 1.0:
-                x = np.float32(1.0)
-            total += x * W1[i, j]
-        if total < 0.0:
-            total = np.float32(0.0)
-        elif total > 1.0:
-            total = np.float32(1.0)
-        raw += total * W2[j]
-    value = np.int64(SCALE * np.tanh(raw))
-    if value > CLIP:
-        value = np.int64(CLIP)
-    elif value < -CLIP:
-        value = np.int64(-CLIP)
-    if st[bb.ST_SIDE] == bb.BLACK:
-        value = -value
-    return value
+    return np.int64(_forward(buf, n, _w1, _b1, _w2, _b2, _w3, _b3, _scale, _clip))
 
 
 @njit(cache=False)
-def nnue_delta(bbs: np.ndarray, st: np.ndarray) -> np.int64:
-    """Rebuild the accumulator from `bbs` and run the MLP. For tests, not search."""
-    acc = np.empty(H1, dtype=np.float32)
-    acc_refresh(acc, bbs)
-    return nnue_affine(acc, st)
+def blend_residual(bbs: np.ndarray, side: np.int64, classical: np.int64) -> np.int64:
+    """classical + 3/5 clip(nnue - classical). 60% NNUE, 40% classical."""
+    buf = np.empty(32, dtype=np.int32)
+    n = fill_indices_bbs(bbs, side, buf)
+    if n == 0:
+        return classical
+    nn = np.int64(_forward(buf, n, _w1, _b1, _w2, _b2, _w3, _b3, _scale, _clip))
+    delta = nn - classical
+    if delta > 600:
+        delta = np.int64(600)
+    elif delta < -600:
+        delta = np.int64(-600)
+    return classical + (delta * 3) // 5
+
+
+def fill_indices(pos: Position, buf: np.ndarray) -> int:
+    stm = pos.side
+    flip = 56 if stm else 0
+    n = 0
+    bb = pos.bb
+    for piece in range(12):
+        bits = bb[piece]
+        stm_piece = piece + 6 if (stm and piece < 6) else piece - 6 if stm else piece
+        plane = stm_piece * 64
+        while bits:
+            sq = (bits & -bits).bit_length() - 1
+            bits &= bits - 1
+            buf[n] = plane + (sq ^ flip)
+            n += 1
+            if n >= buf.shape[0]:
+                return n
+    return n
+
+
+def _unique(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    out: list[Path] = []
+    for path in paths:
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            out.append(path)
+    return out
+
+
+def _agent_root_files() -> list[Path]:
+    raw = Path(__file__)
+    try:
+        resolved = raw.resolve()
+    except OSError:
+        resolved = raw
+    cands: list[Path] = []
+    for base in (resolved, raw):
+        root = base.parent.parent
+        if ".zip" in str(root).replace("\\", "/").lower():
+            continue
+        for name in WEIGHT_NAMES:
+            cands.append(root / name)
+    return cands
+
+
+def _fs_fallback() -> list[Path]:
+    roots: list[Path] = []
+    try:
+        roots.append(Path.cwd())
+        roots.append(Path.cwd() / "v7")
+    except OSError:
+        pass
+    for entry in sys.path:
+        if not entry:
+            continue
+        path = Path(entry)
+        if path.suffix.lower() == ".zip":
+            continue
+        roots.append(path)
+        roots.append(path / "v7")
+    extras = (
+        "v7.1/nnue.npz",
+        "v7.1/weights/nnue.npz",
+        "v7.1/data/nnue.npz",
+        "v7/nnue.npz",
+        "v7/weights/nnue.npz",
+        "v7/data/nnue.npz",
+    )
+    cands: list[Path] = []
+    for root in _unique(roots):
+        for name in WEIGHT_NAMES + extras:
+            cands.append(root / name)
+    return _unique(cands)
+
+
+def _zip_archives() -> list[Path]:
+    archives: list[Path] = []
+    texts = [str(__file__)]
+    try:
+        texts.append(str(Path(__file__).resolve()))
+    except OSError:
+        pass
+    for text in texts:
+        lowered = text.replace("\\", "/").lower()
+        idx = lowered.find(".zip/")
+        if idx != -1:
+            archives.append(Path(text[: idx + 4]))
+        idx = text.lower().find(".zip\\")
+        if idx != -1:
+            archives.append(Path(text[: idx + 4]))
+    for entry in sys.path:
+        if entry and str(entry).lower().endswith(".zip"):
+            archives.append(Path(entry))
+    return _unique(archives)
+
+
+def _npz_from_bytes(data: bytes) -> np.lib.npyio.NpzFile:
+    return np.load(io.BytesIO(data))
+
+
+def _open_from_zip(archive: Path) -> tuple[np.lib.npyio.NpzFile, str] | None:
+    if not archive.is_file():
+        return None
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            names = {name.replace("\\", "/") for name in zf.namelist()}
+            for member in WEIGHT_NAMES:
+                if member in names:
+                    return _npz_from_bytes(zf.read(member)), f"{archive}::{member}"
+            for name in names:
+                if name.rsplit("/", 1)[-1] == "nnue.npz":
+                    return _npz_from_bytes(zf.read(name)), f"{archive}::{name}"
+    except (OSError, zipfile.BadZipFile, KeyError, ValueError):
+        return None
+    return None
+
+
+def _open_from_resources() -> tuple[np.lib.npyio.NpzFile, str] | None:
+    try:
+        import importlib.resources as ir
+
+        pkg = ir.files("engine")
+    except (ModuleNotFoundError, TypeError, OSError, AttributeError):
+        return None
+    for rel in ("../nnue.npz", "../weights/nnue.npz", "../data/nnue.npz"):
+        try:
+            item = pkg.joinpath(rel)
+            if item.is_file():
+                return _npz_from_bytes(item.read_bytes()), f"resources:{rel}"
+        except (OSError, FileNotFoundError, ValueError, AttributeError, NotImplementedError):
+            continue
+    return None
+
+
+def discover_weights() -> tuple[np.lib.npyio.NpzFile, str] | None:
+    for path in _agent_root_files():
+        try:
+            if path.is_file():
+                return np.load(path), str(path)
+        except OSError:
+            continue
+    found = _open_from_resources()
+    if found is not None:
+        return found
+    for archive in _zip_archives():
+        found = _open_from_zip(archive)
+        if found is not None:
+            return found
+    for path in _fs_fallback():
+        try:
+            if path.is_file():
+                return np.load(path), str(path)
+        except OSError:
+            continue
+    return None
+
+
+def load_nnue(path: Path | None = None) -> None:
+    global _w1, _b1, _w2, _b2, _w3, _b3, _scale, _clip, _ready
+    global HIDDEN1, HIDDEN2, LOADED_FROM
+    if path is not None:
+        blob = np.load(path)
+        LOADED_FROM = str(path)
+    else:
+        found = discover_weights()
+        if found is None:
+            raise FileNotFoundError("nnue.npz not found next to agent.py, in weights/, or in data/")
+        blob, LOADED_FROM = found
+    _w1 = np.ascontiguousarray(blob["fc1_weight"].T, dtype=np.float32)
+    _b1 = np.ascontiguousarray(blob["fc1_bias"], dtype=np.float32)
+    _w2 = np.ascontiguousarray(blob["fc2_weight"].T, dtype=np.float32)
+    _b2 = np.ascontiguousarray(blob["fc2_bias"], dtype=np.float32)
+    _w3 = np.ascontiguousarray(blob["fc3_weight"].T, dtype=np.float32)
+    _b3 = np.ascontiguousarray(blob["fc3_bias"], dtype=np.float32)
+    _scale = np.float32(blob["scale"]) if "scale" in blob.files else np.float32(400.0)
+    _clip = np.float32(blob["clip"]) if "clip" in blob.files else np.float32(2000.0)
+    if _w1.shape[0] != N_FEATURES:
+        raise ValueError(f"bad fc1 {_w1.shape}")
+    HIDDEN1 = int(_w1.shape[1])
+    HIDDEN2 = int(_w2.shape[1])
+    dummy = np.array([0, 64, 700], dtype=np.int32)
+    _forward(dummy, np.int32(3), _w1, _b1, _w2, _b2, _w3, _b3, _scale, _clip)
+    _ready = True
+
+
+def is_ready() -> bool:
+    return _ready
+
+
+def evaluate_nnue(pos: Position) -> int:
+    n = fill_indices(pos, _idx_buf)
+    if n == 0:
+        return 0
+    score = float(
+        _forward(_idx_buf, np.int32(n), _w1, _b1, _w2, _b2, _w3, _b3, _scale, _clip)
+    )
+    clip = float(_clip)
+    if score > clip:
+        score = clip
+    elif score < -clip:
+        score = -clip
+    return int(score)
+
+
+def warmup() -> None:
+    if _ready:
+        return
+    load_nnue()
+    evaluate_nnue(Position.start())
+    print(f"NNUE: loaded {LOADED_FROM}", flush=True)

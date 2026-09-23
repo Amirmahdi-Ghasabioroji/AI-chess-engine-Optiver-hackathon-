@@ -9,7 +9,7 @@ from __future__ import annotations
 import chess
 import numpy as np
 
-from engine import bb
+import bb
 
 _PROMO_CHAR = {1: "n", 2: "b", 3: "r", 4: "q"}
 _PROMO_CODE = {chess.KNIGHT: 1, chess.BISHOP: 2, chess.ROOK: 3, chess.QUEEN: 4}

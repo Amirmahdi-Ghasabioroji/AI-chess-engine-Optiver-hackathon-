@@ -69,7 +69,7 @@ _LINES: tuple[str, ...] = (
     "d2d4 g8f6 c2c4 e7e5 d4e5 f6e4 g1f3 b8c6",
     "d2d4 f7f5 c2c4 g8f6 g2g3 e7e6 f1g2 f8e7",
     "d2d4 d7d5 c2c4 e7e6 b1c3 c7c5 c4d5 e6d5 g1f3 b8c6",
-    # English / Reti / Flank — 12–16 ply so curated starts still hit
+    # English / Reti / Flank — extra ply so curated starts still hit
     "c2c4 e7e5 b1c3 g8f6 g1f3 b8c6 g2g3 d7d5 c4d5 f6d5 f1g2 d5b6 e1g1 f8e7 d2d3 e8g8",
     "c2c4 e7e5 b1c3 g8f6 g1f3 b8c6 e2e3 f8b4 d1c2 e8g8 a2a3 b4c3 c2c3 d7d5",
     "c2c4 e7e5 b1c3 g8f6 g1f3 b8c6 g2g3 f8b4 f1g2 e8g8 e1g1 f8e8 d2d3 h7h6",
@@ -146,10 +146,11 @@ _LINES: tuple[str, ...] = (
     "d2d4 g8f6 b1c3 d7d5 c1f4",
     "d2d4 g8f6 c1g5 e7e6 e2e4 h7h6 g5h4",
     "d2d4 d7d5 g1f3 g8f6 e2e3 e7e6 f1d3 c7c5",
-    # English extra (move-order transpositions already covered above)
+    # English extra
+    "c2c4 e7e5 b1c3 g8f6 g1f3 b8c6 g2g3 d7d5 c4d5 f6d5 f1g2 d5b6",
+    "c2c4 c7c5 g1f3 g8f6 b1c3 b8c6 g2g3 g7g6 f1g2 f8g7 e1g1 e8g8",
     "c2c4 e7e5 b1c3 g8f6 g2g3 d7d5 c4d5 f6d5 f1g2 d5b6 e2e3 f8e7 g1e2 e8g8 e1g1",
-    # Extra mainlines for curated near-equal starts (Petrov, Scotch, Dragon,
-    # Taimanov, QGA, Benko, Dutch, KIA, Vienna, Philidor, …)
+    # Extra mainlines for curated near-equal starts
     "e2e4 e7e5 g1f3 g8f6 f3e5 d7d6 e5f3 f6e4 d2d4 d6d5 f1d3 b8c6 e1g1 f8e7",
     "e2e4 e7e5 g1f3 g8f6 d2d4 f6e4 f1d3 d7d5 f3e5 b8d7",
     "e2e4 e7e5 g1f3 b8c6 b1c3 g8f6 f1b5 f8b4 e1g1 e8g8 d2d3 d7d6",
@@ -264,9 +265,3 @@ def probe(board: chess.Board) -> chess.Move | None:
     if move in board.legal_moves:
         return move
     return None
-
-
-def book_move(fen: str) -> str | None:
-    """UCI reply for a FEN, or None. Same book as probe()."""
-    move = probe(chess.Board(fen))
-    return None if move is None else move.uci()
