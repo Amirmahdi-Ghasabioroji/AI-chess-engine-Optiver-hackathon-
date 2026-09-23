@@ -1,0 +1,4 @@
+{"opening": 0, "agent_white": true, "score": 1.0, "termination": "checkmate", "fen": "r1bq1rk1/2p1bppp/p1np1n2/1p2p3/4P3/1BP2N2/PP1P1PPP/RNBQR1K1 w - - 1 9", "stderr": "", "pgn": ""}
+{"opening": 0, "agent_white": false, "score": 0.0, "termination": "checkmate", "fen": "r1bq1rk1/2p1bppp/p1np1n2/1p2p3/4P3/1BP2N2/PP1P1PPP/RNBQR1K1 w - - 1 9", "stderr": "", "pgn": ""}
+{"opening": 1, "agent_white": true, "score": 0.0, "termination": "checkmate", "fen": "r1bq1rk1/2ppbppp/p1n2n2/1p2p3/4P3/1B3N2/PPPP1PPP/RNBQR1K1 w - - 2 8", "stderr": "", "pgn": ""}
+{"opening": 1, "agent_white": false, "score": 0.0, "termination": "checkmate", "fen": "r1bq1rk1/2ppbppp/p1n2n2/1p2p3/4P3/1B3N2/PPPP1PPP/RNBQR1K1 w - - 2 8", "stderr": "", "pgn": ""}

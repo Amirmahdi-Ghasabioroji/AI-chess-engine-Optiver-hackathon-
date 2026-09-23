@@ -1,0 +1,11 @@
+# Local development stack. The judge ignores requirements.txt and ships:
+#   torch 2.13.0+cpu, numpy 2.5.2, python-chess 1.11.2,
+#   onnxruntime 1.29.0, numba 0.67.0
+# This machine has Python 3.10, so numpy is pinned to the newest 3.10 wheel.
+# Agent code stays compatible with the judge's 3.12 + listed versions.
+numpy==2.2.6
+python-chess==1.999
+chess==1.11.2
+onnxruntime==1.23.2
+numba==0.67.0
+kagglehub==1.0.2

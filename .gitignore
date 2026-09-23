@@ -1,0 +1,30 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+tmp/
+dist/
+.idea/
+.vscode/
+.env
+.env.*
+
+# Build artefacts. Recreate with `make zip` / `python -m tools.pack`.
+submission.zip
+*.zip
+
+# Local Stockfish, used only to label training data. Never ship it.
+tools/sf/
+
+# Training dumps (regenerate). About 21 GB of Lichess data lives here.
+data/
+
+# Historical engine trees and submission zips. Kept on disk, not in git.
+local/
+
+# Gauntlet, measure, and one-off game dumps. Round-robin logs under
+# experiments/logs/ are tracked.
+/logs/

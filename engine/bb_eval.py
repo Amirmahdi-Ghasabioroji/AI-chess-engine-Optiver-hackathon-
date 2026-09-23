@@ -1,0 +1,436 @@
+"""Tapered PeSTO evaluation and a full static exchange, on bitboards.
+
+PeSTO is the baseline. A linear piece-square residual, ridge-fit on Stockfish
+labels, is one add per piece at every node. The MLP and its incremental
+accumulator live in `nnue.py` for training and tests; they are not on the
+search hot path because they cost ply this net has not earned.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+from numba import njit
+
+from . import bb
+from .bb import (
+    BISHOP,
+    KING,
+    KNIGHT,
+    NOT_FILE_A,
+    NOT_FILE_H,
+    OCC_B,
+    OCC_W,
+    PAWN,
+    QUEEN,
+    ROOK,
+    ST_SIDE,
+    WHITE,
+    bishop_attacks,
+    lsb,
+    lsr,
+    popcount,
+    rook_attacks,
+)
+from .evaluate import (
+    _EG_BISHOP,
+    _EG_KING,
+    _EG_KNIGHT,
+    _EG_PAWN,
+    _EG_QUEEN,
+    _EG_ROOK,
+    _MG_BISHOP,
+    _MG_KING,
+    _MG_KNIGHT,
+    _MG_PAWN,
+    _MG_QUEEN,
+    _MG_ROOK,
+    EG_VALUE,
+    MG_VALUE,
+)
+
+PHASE_MAX = 24
+TEMPO = 10
+
+SEE_VALUE = np.array([100, 320, 330, 500, 900, 20000], dtype=np.int64)
+PHASE_WEIGHT = np.array([0, 1, 1, 2, 4, 0], dtype=np.int64)
+
+_MG_PST = (_MG_PAWN, _MG_KNIGHT, _MG_BISHOP, _MG_ROOK, _MG_QUEEN, _MG_KING)
+_EG_PST = (_EG_PAWN, _EG_KNIGHT, _EG_BISHOP, _EG_ROOK, _EG_QUEEN, _EG_KING)
+
+# MG_TABLE[code * 64 + square] folds material into the piece-square value and is
+# already oriented for that colour, so evaluation is one lookup per piece.
+MG_TABLE = np.zeros(12 * 64, dtype=np.int64)
+EG_TABLE = np.zeros(12 * 64, dtype=np.int64)
+for _type in range(6):
+    for _square in range(64):
+        MG_TABLE[_type * 64 + _square] = MG_VALUE[_type + 1] + _MG_PST[_type][_square ^ 56]
+        EG_TABLE[_type * 64 + _square] = EG_VALUE[_type + 1] + _EG_PST[_type][_square ^ 56]
+        MG_TABLE[(_type + 6) * 64 + _square] = MG_VALUE[_type + 1] + _MG_PST[_type][_square]
+        EG_TABLE[(_type + 6) * 64 + _square] = EG_VALUE[_type + 1] + _EG_PST[_type][_square]
+
+FILE_BB = np.array([bb._u64(0x0101010101010101 << f) for f in range(8)], dtype=np.int64)
+RANK_BB = np.array([bb._u64(0xFF << (8 * r)) for r in range(8)], dtype=np.int64)
+
+_ADJACENT = [
+    (0x0101010101010101 << (f - 1) if f > 0 else 0) | (0x0101010101010101 << (f + 1) if f < 7 else 0)
+    for f in range(8)
+]
+ISOLATED_FILE = np.array([bb._u64(m) for m in _ADJACENT], dtype=np.int64)
+
+
+def _passed_mask(square: int, white: bool) -> int:
+    f, r = square & 7, square >> 3
+    span = _ADJACENT[f] | (0x0101010101010101 << f)
+    mask = 0
+    ranks = range(r + 1, 8) if white else range(r - 1, -1, -1)
+    for rr in ranks:
+        mask |= span & (0xFF << (8 * rr))
+    return mask
+
+
+PASSED_W = np.array([bb._u64(_passed_mask(s, True)) for s in range(64)], dtype=np.int64)
+PASSED_B = np.array([bb._u64(_passed_mask(s, False)) for s in range(64)], dtype=np.int64)
+
+PASSED_MG = np.array([0, 2, 6, 12, 24, 48, 80, 0], dtype=np.int64)
+PASSED_EG = np.array([0, 8, 16, 32, 56, 96, 160, 0], dtype=np.int64)
+
+# White-oriented residual PST, trained offline. Filled by load_residual().
+LINEAR = np.zeros(12 * 64, dtype=np.int64)
+RESIDUAL_PATH = Path(__file__).resolve().parent.parent / "weights" / "pst.npz"
+
+# Pawn-structure cache keyed on the two pawn bitboards; a collision just recomputes.
+# Numba exposes module-level arrays read-only, so the cache travels as an argument:
+# columns are (key, mg, eg) and the key is forced odd so an empty slot never matches.
+PAWN_HASH_BITS = 14
+PAWN_HASH_SIZE = 1 << PAWN_HASH_BITS
+
+
+def new_pawn_cache() -> np.ndarray:
+    return np.zeros((PAWN_HASH_SIZE, 3), dtype=np.int64)
+
+
+def load_residual(path: Path | None = None) -> bool:
+    """Load the trained PST residual before the first jitted eval."""
+    target = path if path is not None else RESIDUAL_PATH
+    LINEAR[:] = 0
+    if not target.is_file():
+        return False
+    try:
+        blob = np.load(target)
+        weights = np.asarray(blob["w"], dtype=np.float32).reshape(-1)
+        n = min(LINEAR.size, weights.size)
+        LINEAR[:n] = np.clip(np.rint(weights[:n]), -64, 64).astype(np.int64)
+        return True
+    except (OSError, KeyError, ValueError):
+        LINEAR[:] = 0
+        return False
+
+
+@njit(cache=False)
+def pawn_terms(wp: np.int64, bp: np.int64) -> tuple:
+    mg = np.int64(0)
+    eg = np.int64(0)
+
+    b = wp
+    while b != 0:
+        sq = lsb(b)
+        b &= b - 1
+        f = sq & 7
+        r = sq >> 3
+        ahead = FILE_BB[f] & ~((bb.BIT[sq] - 1) | bb.BIT[sq])
+        if wp & ahead:
+            mg -= 8
+            eg -= 18
+        if not (wp & ISOLATED_FILE[f]):
+            mg -= 12
+            eg -= 16
+        if not (bp & PASSED_W[sq]):
+            mg += PASSED_MG[r]
+            eg += PASSED_EG[r]
+
+    b = bp
+    while b != 0:
+        sq = lsb(b)
+        b &= b - 1
+        f = sq & 7
+        r = sq >> 3
+        behind = FILE_BB[f] & (bb.BIT[sq] - 1)
+        if bp & behind:
+            mg += 8
+            eg += 18
+        if not (bp & ISOLATED_FILE[f]):
+            mg += 12
+            eg += 16
+        if not (wp & PASSED_B[sq]):
+            mg -= PASSED_MG[7 - r]
+            eg -= PASSED_EG[7 - r]
+
+    return mg, eg
+
+
+@njit(cache=False)
+def pawn_terms_hashed(wp: np.int64, bp: np.int64, pc: np.ndarray) -> tuple:
+    key = ((wp * -7046029254386353131) ^ (bp * -4417276706812531889)) | 1
+    i = key & (PAWN_HASH_SIZE - 1)
+    if pc[i, 0] == key:
+        return pc[i, 1], pc[i, 2]
+    mg, eg = pawn_terms(wp, bp)
+    pc[i, 0] = key
+    pc[i, 1] = mg
+    pc[i, 2] = eg
+    return mg, eg
+
+
+@njit(cache=False)
+def king_shield(king_sq: np.int64, pawns: np.int64, white: bool) -> np.int64:
+    f = king_sq & 7
+    if 2 < f < 5:
+        return np.int64(0)
+    r = king_sq >> 3
+    shield_rank = r + 1 if white else r - 1
+    if shield_rank < 0 or shield_rank > 7:
+        return np.int64(0)
+    bonus = np.int64(0)
+    for df in range(-1, 2):
+        ff = f + df
+        if 0 <= ff <= 7:
+            if pawns & bb.BIT[shield_rank * 8 + ff]:
+                bonus += 12
+            else:
+                bonus -= 8
+    return bonus
+
+
+@njit(cache=False)
+def non_pawn_material(bbs: np.ndarray, side: np.int64) -> np.int64:
+    base = side * 6
+    total = np.int64(0)
+    for t in range(KNIGHT, KING):
+        total += SEE_VALUE[t] * popcount(bbs[base + t])
+    return total
+
+
+@njit(cache=False)
+def evaluate(bbs: np.ndarray, st: np.ndarray, pc: np.ndarray) -> np.int64:
+    """PeSTO + linear PST residual. Used in PVS and qsearch."""
+    score = _pesto(bbs, st, pc)
+    lin = np.int64(0)
+    for code in range(12):
+        b = bbs[code]
+        while b != 0:
+            sq = lsb(b)
+            b &= b - 1
+            lin += LINEAR[code * 64 + sq]
+    if st[ST_SIDE] != WHITE:
+        lin = -lin
+    return score + lin
+
+
+@njit(cache=False)
+def evaluate_classical(bbs: np.ndarray, st: np.ndarray, pc: np.ndarray) -> np.int64:
+    """PeSTO + threats only. Used to label training data."""
+    return _pesto(bbs, st, pc)
+
+
+@njit(cache=False)
+def _pesto(bbs: np.ndarray, st: np.ndarray, pc: np.ndarray) -> np.int64:
+    mg = np.int64(0)
+    eg = np.int64(0)
+    phase = np.int64(0)
+
+    for code in range(12):
+        b = bbs[code]
+        if b == 0:
+            continue
+        sign = 1 if code < 6 else -1
+        t = code % 6
+        phase += PHASE_WEIGHT[t] * popcount(b)
+        while b != 0:
+            sq = lsb(b)
+            b &= b - 1
+            mg += sign * MG_TABLE[code * 64 + sq]
+            eg += sign * EG_TABLE[code * 64 + sq]
+
+    if popcount(bbs[BISHOP]) >= 2:
+        mg += 25
+        eg += 40
+    if popcount(bbs[6 + BISHOP]) >= 2:
+        mg -= 25
+        eg -= 40
+
+    wp = bbs[PAWN]
+    bp = bbs[6 + PAWN]
+    pmg, peg = pawn_terms_hashed(wp, bp, pc)
+    mg += pmg
+    eg += peg
+
+    all_pawns = wp | bp
+    b = bbs[ROOK]
+    while b != 0:
+        sq = lsb(b)
+        b &= b - 1
+        file_bb = FILE_BB[sq & 7]
+        if not (all_pawns & file_bb):
+            mg += 18
+            eg += 12
+        elif not (wp & file_bb):
+            mg += 8
+            eg += 6
+        if bb.BIT[sq] & RANK_BB[6]:
+            mg += 12
+            eg += 18
+    b = bbs[6 + ROOK]
+    while b != 0:
+        sq = lsb(b)
+        b &= b - 1
+        file_bb = FILE_BB[sq & 7]
+        if not (all_pawns & file_bb):
+            mg -= 18
+            eg -= 12
+        elif not (bp & file_bb):
+            mg -= 8
+            eg -= 6
+        if bb.BIT[sq] & RANK_BB[1]:
+            mg -= 12
+            eg -= 18
+
+    wk = lsb(bbs[KING])
+    bk = lsb(bbs[6 + KING])
+    mg += king_shield(wk, wp, True)
+    mg -= king_shield(bk, bp, False)
+
+    watt = ((wp & NOT_FILE_A) << 7) | ((wp & NOT_FILE_H) << 9)
+    batt = lsr(bp & NOT_FILE_H, 7) | lsr(bp & NOT_FILE_A, 9)
+    mg += _pawn_threats(watt, batt, bbs)
+
+    if phase > PHASE_MAX:
+        phase = PHASE_MAX
+    score = (mg * phase + eg * (PHASE_MAX - phase)) // PHASE_MAX
+
+    side = st[ST_SIDE]
+    score += TEMPO if side == WHITE else -TEMPO
+
+    if phase <= 8:
+        w_material = non_pawn_material(bbs, np.int64(0)) + 100 * popcount(wp)
+        b_material = non_pawn_material(bbs, np.int64(1)) + 100 * popcount(bp)
+        diff = w_material - b_material
+        if diff >= 350 or diff <= -350:
+            chebyshev = max(abs((wk & 7) - (bk & 7)), abs((wk >> 3) - (bk >> 3)))
+            if diff > 0:
+                edge = min(min(bk & 7, 7 - (bk & 7)), min(bk >> 3, 7 - (bk >> 3)))
+                score += 4 * (7 - chebyshev) + 12 * (3 - edge)
+            else:
+                edge = min(min(wk & 7, 7 - (wk & 7)), min(wk >> 3, 7 - (wk >> 3)))
+                score -= 4 * (7 - chebyshev) + 12 * (3 - edge)
+
+    return score if side == WHITE else -score
+
+
+@njit(cache=False)
+def _pawn_threats(watt: np.int64, batt: np.int64, bbs: np.ndarray) -> np.int64:
+    """Bonus for pawns attacking enemy pieces (not kings)."""
+    w_minors = bbs[KNIGHT] | bbs[BISHOP]
+    w_majors = bbs[ROOK] | bbs[QUEEN]
+    b_minors = bbs[6 + KNIGHT] | bbs[6 + BISHOP]
+    b_majors = bbs[6 + ROOK] | bbs[6 + QUEEN]
+    mg = np.int64(0)
+    mg += 18 * popcount(watt & b_minors) + 36 * popcount(watt & b_majors)
+    mg -= 18 * popcount(batt & w_minors) + 36 * popcount(batt & w_majors)
+    return mg
+
+
+# ------------------------------------------------------------------------- SEE
+
+
+@njit(cache=False)
+def attackers_to(bbs: np.ndarray, sq: np.int64, occ: np.int64) -> np.int64:
+    """Every piece of either colour that attacks `sq` given occupancy `occ`."""
+    result = bb.PAWN_ATT[sq] & bbs[6 + PAWN]
+    result |= bb.PAWN_ATT[64 + sq] & bbs[PAWN]
+    result |= bb.KNIGHT_ATT[sq] & (bbs[KNIGHT] | bbs[6 + KNIGHT])
+    result |= bb.KING_ATT[sq] & (bbs[KING] | bbs[6 + KING])
+    diagonal = bishop_attacks(sq, occ)
+    result |= diagonal & (bbs[BISHOP] | bbs[QUEEN] | bbs[6 + BISHOP] | bbs[6 + QUEEN])
+    straight = rook_attacks(sq, occ)
+    result |= straight & (bbs[ROOK] | bbs[QUEEN] | bbs[6 + ROOK] | bbs[6 + QUEEN])
+    return result & occ
+
+
+@njit(cache=False)
+def _least_valuable(bbs: np.ndarray, attackers: np.int64, side: np.int64) -> np.int64:
+    base = side * 6
+    for t in range(6):
+        subset = attackers & bbs[base + t]
+        if subset != 0:
+            return subset & -subset
+    return np.int64(0)
+
+
+@njit(cache=False)
+def see(bbs: np.ndarray, mb: np.ndarray, mv: np.int64) -> np.int64:
+    """Exact swap-off value of a capture, in centipawns, for the side to move."""
+    frm = mv & 63
+    to = (mv >> 6) & 63
+    promo = (mv >> 12) & 7
+    mtype = (mv >> 15) & 3
+
+    moving = np.int64(mb[frm])
+    side = moving // 6
+    moving_type = moving % 6
+
+    gain = np.empty(34, dtype=np.int64)
+    if mtype == bb.MT_EP:
+        gain[0] = SEE_VALUE[PAWN]
+    else:
+        victim = np.int64(mb[to])
+        gain[0] = SEE_VALUE[victim % 6] if victim >= 0 else np.int64(0)
+
+    if promo != 0:
+        gain[0] += SEE_VALUE[promo] - SEE_VALUE[PAWN]
+        moving_type = promo
+
+    occ = (bbs[OCC_W] | bbs[OCC_B]) & ~bb.BIT[frm]
+    if mtype == bb.MT_EP:
+        occ &= ~bb.BIT[to - 8 if side == WHITE else to + 8]
+
+    attackers = attackers_to(bbs, to, occ)
+    on_move = 1 - side
+    depth = 0
+    captured_value = SEE_VALUE[moving_type]
+
+    while True:
+        attackers &= occ
+        piece_bb = _least_valuable(bbs, attackers, on_move)
+        if piece_bb == 0:
+            break
+        # A king may only take when nothing of the other colour still defends the
+        # square, otherwise the recapture would be into check.
+        if piece_bb & bbs[on_move * 6 + KING]:
+            if _least_valuable(bbs, attackers & ~piece_bb, 1 - on_move) != 0:
+                break
+        depth += 1
+        gain[depth] = captured_value - gain[depth - 1]
+        # The usual `max(-gain[d-1], gain[d]) < 0` cut-off is only sign-correct.
+        # The search compares SEE against non-zero thresholds, so run the swap out.
+        square = lsb(piece_bb)
+        captured_value = SEE_VALUE[np.int64(mb[square]) % 6]
+        occ &= ~piece_bb
+        attackers = attackers_to(bbs, to, occ)
+        on_move = 1 - on_move
+        if depth >= 31:
+            break
+
+    while depth > 0:
+        gain[depth - 1] = -max(-gain[depth - 1], gain[depth])
+        depth -= 1
+    return gain[0]
+
+
+@njit(cache=False)
+def see_ge(bbs: np.ndarray, mb: np.ndarray, mv: np.int64, threshold: np.int64) -> bool:
+    return see(bbs, mb, mv) >= threshold
+
+
+load_residual()
