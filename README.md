@@ -5,34 +5,35 @@ imports `agent.py` and calls `get_move(fen, time_left_ms)`. The return value is 
 UCI move such as `e2e4` or `e7e8q`. The side to move in the FEN is our side.
 There is no other input.
 
-The playing engine is a numba bitboard search. Evaluation is tapered
-[PeSTO](https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function) plus a
-linear piece-square residual trained offline and stored in `weights/pst.npz`.
-python-chess is used only to parse the FEN and to check that the move we return
-is legal. If the bitboard search ever proposes an illegal move, `agent.py`
-falls back to a legal one so a bug does not lose the game by itself.
+The root engine is **v7.1.1**. `agent.py` calls `engine.play`, which runs the
+numba PVS in `engine/bb_search.py`. The leaf evaluation is classical PeSTO
+mixed with the trained net in `weights/nnue.npz`: classical plus three-fifths
+of the clipped gap between the net and classical (60% net, 40% classical).
+The net is required. `ROADMAP.md` is the short note that shipped with this
+version.
 
-Search does not call the small MLP in `engine/nnue.py`. That module, and the
-`nnue*.npz` / `nnue*.pt` files next to `pst.npz`, are the training and
-experiment nets. `agent.py` still loads and warms them at import so a later
-switch-on does not pay compilation on the clock. The packer includes the whole
-`weights/` directory, so those files are in the submission zip.
+python-chess parses the FEN. If `get_move` raises, it returns a legal move so
+a Python exception does not forfeit the game by itself.
 
-There is no pondering. A jitted search holds the GIL for the whole call, and a
-missed deadline loses the game.
+Two other engines are in the repo for comparison, and are not what the zip plays:
+
+| Engine | Path | What it is |
+|---|---|---|
+| v2.1 | `baselines/v2.1` | Classical numba bitboard engine. No network. |
+| Stage 3 | `baselines/self_v3` | The previous root: PeSTO plus a linear piece-square residual. |
 
 ## Where to start reading
 
 A reviewer who wants the playing code, in this order:
 
-1. `agent.py` — time split, opening book, legality check, import-time warmup.
-2. `engine/bb_search.py` — iterative-deepening PVS, transposition table, quiescence.
-3. `engine/bb_eval.py` — PeSTO, static exchange, and the PST residual. `evaluate()` is what search calls.
-4. `engine/bb.py` — bitboards and move generation.
-5. `engine/book.py` — opening book built from mainlines at import.
-6. `engine/bbpos.py` — FEN and UCI conversion. This is the python-chess boundary.
-7. `engine/evaluate.py` — the pure-Python PeSTO reference. `tools/check_eval.py` checks the bitboard eval against it.
-8. `engine/nnue.py` — MLP residual used by training and tests, not by the search leaves.
+1. `ROADMAP.md` — what v7.1.1 changed and what not to undo.
+2. `agent.py` — import-time warmup, then `get_move`.
+3. `engine/play.py` — clock, book, and the call into search.
+4. `engine/bb_search.py` — iterative-deepening PVS, transposition table, quiescence.
+5. `engine/bb_eval.py` — `evaluate()` is the classical + NNUE mix. Classical PeSTO is also used for static exchange.
+6. `engine/nnue.py` — loads `weights/nnue.npz` and blends the net into the eval.
+7. `engine/bb.py` — bitboards and move generation.
+8. `baselines/v2.1/agent.py` — the published classical engine, with its own copies of the search files beside that `agent.py`.
 
 Longer design notes are in `docs/DESIGN.md`, `docs/NEXT_ENGINE.md`, and `docs/IDEAS.md`.
 
@@ -41,15 +42,16 @@ Longer design notes are in `docs/DESIGN.md`, `docs/NEXT_ENGINE.md`, and `docs/ID
 | Path | In the submission zip | Role |
 |---|---|---|
 | `agent.py` | yes | The only module the platform imports. |
-| `engine/` | yes | Search, eval, book, NNUE code. |
-| `weights/` | yes | `pst.npz` (played) and the NNUE files (loaded, not the leaf eval). |
+| `engine/` | yes | v7.1.1 search, eval, book, and NNUE code. |
+| `weights/nnue.npz` | yes | The net v7.1.1 evaluates. |
+| `ROADMAP.md` | no | v7.1.1 notes. |
 | `harness/` | no | Official game runner. Mirrors the platform clock. Leave it unchanged. |
-| `baselines/` | no | Opponents for local games. Leave `self_v1`, `self_v2`, and `self_v3` unchanged. |
+| `baselines/` | no | Local opponents, including published `v2.1` and frozen `self_v1`–`self_v3`. |
 | `tools/` | no | Pack, gauntlet, perft, smoke, benches. |
 | `training/` | no | Offline labelling and training. |
 | `experiments/` | no | Round-robin drivers, `RESULTS.md`, and saved game logs. |
 | `docs/` | no | Design notes. |
-| `archive/` | no | Stage 1 Python search (`search.py`). Timed by `tools/search_bench.py`. |
+| `archive/` | no | Stage 1 Python search, plus `stage3_weights/` from the previous root. |
 | `.github/workflows/ci.yml` | no | `make gate` on Ubuntu, plus a two-game arena on macOS and Windows. |
 
 These paths exist only on a working machine. They are gitignored:
@@ -127,14 +129,15 @@ Frozen opponents, oldest first. Do not edit them. They are the A/B line for late
 | `baselines/random`, `greedy`, `minimax`, `numba` | Starter bots from the official harness. |
 | `baselines/self_v1` | Pure-Python PVS, before the bitboard port. |
 | `baselines/self_v2` | Numba bitboards and PeSTO. |
-| `baselines/self_v3` | PeSTO plus the linear PST residual. |
+| `baselines/v2.1` | Published classical engine (search and eval only, no network). |
+| `baselines/self_v3` | Previous root. PeSTO plus a linear PST residual. |
 
 Other local checks:
 
 | Command | What it checks |
 |---|---|
 | `uv run python -m tools.perft` | Move generation against python-chess. |
-| `uv run python -m tools.check_eval` | Bitboard eval against `engine/evaluate.py`, and SEE sanity. |
+| `uv run python -m tools.check_eval` | Written for the Stage 3 eval in `baselines/self_v3`, which had `engine/evaluate.py`. |
 | `uv run python -m tools.smoke` | Legality, mate-in-one, the clock, and a book probe. |
 | `uv run python -m tools.search_bench` | Node rate of the bitboard search and of `archive/search.py`. |
 | `uv run python -m tools.import_cost` | How the 60 second import budget is spent. |
@@ -172,13 +175,7 @@ Both scripts resolve opponents under `local/engine_snapshots/`. That directory i
 
 Training scripts live in `training/` and are not part of the zip. They read and write `data/`, which is gitignored. Labels may come from the local Stockfish in `tools/sf/`. That binary annotates positions. It is not imported by `agent.py` and must not be packed.
 
-The residual the search actually adds is produced by:
-
-```powershell
-uv run python -m training.train_pst --data data/nnue_train.npz
-```
-
-That writes `weights/pst.npz`. `training/gen_nnue.py` plays quiet positions with this engine and records Stockfish scores into `data/`. The other `train_*.py` and `import_*.py` scripts fit or fine-tune the MLP nets used in the version experiments.
+v7.1.1 plays the net already stored in `weights/nnue.npz`. The scripts under `training/` fit earlier nets and the Stage 3 piece-square residual. Several of them import the Stage 3 module layout, so they are not the training entry point for the root engine.
 
 ## License
 
